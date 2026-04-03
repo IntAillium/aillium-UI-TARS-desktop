@@ -30,6 +30,7 @@ import { registerSettingsHandlers } from './services/settings';
 import { sanitizeState } from './utils/sanitizeState';
 import { windowManager } from './services/windowManager';
 import { checkBrowserAvailability } from './services/browserCheck';
+import { startDesktopRpcBridge } from './services/desktopRpcBridge';
 
 const { isProd } = env;
 
@@ -115,6 +116,7 @@ const initializeApp = async () => {
   logger.info('mainZustandBridge');
 
   const { unsubscribe } = registerIPCHandlers([mainWindow]);
+  const desktopRpcBridge = startDesktopRpcBridge();
 
   app.on('window-all-closed', () => {
     logger.info('window-all-closed');
@@ -132,6 +134,7 @@ const initializeApp = async () => {
   app.on('quit', () => {
     logger.info('app quit');
     unsubscribe();
+    void desktopRpcBridge.close();
   });
 
   app.on('activate', () => {
