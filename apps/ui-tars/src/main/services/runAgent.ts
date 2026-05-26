@@ -250,7 +250,7 @@ export const runAgent = async (
       });
     });
 
-  logger.info('[runAgent Totoal cost]: ', (Date.now() - startTime) / 1000, 's');
+  logger.info('[runAgent Total cost]: ', (Date.now() - startTime) / 1000, 's');
 
   afterAgentRun(settings.operator);
 };
