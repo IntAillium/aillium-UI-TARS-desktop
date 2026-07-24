@@ -1,5 +1,6 @@
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { jwtVerify } from 'jose';
 import { server as ipcServer } from '@main/ipcRoutes';
 import { logger } from '@main/logger';
 import { showWindow } from '@main/window/index';
@@ -36,6 +37,13 @@ const DESKTOP_RPC_TOKEN =
   process.env.AILLIUM_UI_TARS_DESKTOP_BRIDGE_TOKEN?.trim() ||
   process.env.AILLIUM_DESKTOP_BRIDGE_TOKEN?.trim() ||
   '';
+
+// Dedicated secret for verifying Aillium per-user pairing tokens (never the
+// login JWT_SECRET). When set, a valid pairing JWT authorizes the caller in
+// addition to the static bridge token, so a provisioned per-user install works
+// without sharing one static token across every machine.
+const DESKTOP_PAIRING_SECRET =
+  process.env.AILLIUM_DESKTOP_PAIRING_SECRET?.trim() || '';
 
 const CAPABILITIES: CapabilityDescriptor[] = [
   {
@@ -172,11 +180,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body));
 }
 
-function isAuthorized(req: IncomingMessage) {
-  if (!DESKTOP_RPC_TOKEN) {
-    return true;
-  }
-
+function readPresentedToken(req: IncomingMessage) {
   const authorization =
     typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
   const bearerToken = authorization.startsWith('Bearer ')
@@ -186,9 +190,39 @@ function isAuthorized(req: IncomingMessage) {
     typeof req.headers['x-aillium-desktop-token'] === 'string'
       ? req.headers['x-aillium-desktop-token'].trim()
       : '';
-  const presented = bearerToken || headerToken;
+  return bearerToken || headerToken;
+}
 
-  return presented.length > 0 && presented === DESKTOP_RPC_TOKEN;
+async function isValidPairingToken(token: string) {
+  if (!DESKTOP_PAIRING_SECRET) {
+    return false;
+  }
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      new TextEncoder().encode(DESKTOP_PAIRING_SECRET),
+      { audience: 'aillium-desktop' },
+    );
+    return payload.purpose === 'desktop-pairing';
+  } catch {
+    return false;
+  }
+}
+
+async function isAuthorized(req: IncomingMessage) {
+  // No auth configured (local/dev): allow, matching the previous behavior.
+  if (!DESKTOP_RPC_TOKEN && !DESKTOP_PAIRING_SECRET) {
+    return true;
+  }
+
+  const presented = readPresentedToken(req);
+  if (!presented) {
+    return false;
+  }
+  if (DESKTOP_RPC_TOKEN && presented === DESKTOP_RPC_TOKEN) {
+    return true;
+  }
+  return isValidPairingToken(presented);
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -588,7 +622,7 @@ export function startDesktopRpcBridge() {
       return;
     }
 
-    if (!isAuthorized(req)) {
+    if (!(await isAuthorized(req))) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
     }
