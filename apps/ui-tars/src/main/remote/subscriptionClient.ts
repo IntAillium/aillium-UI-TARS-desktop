@@ -90,7 +90,10 @@ export class SubscriptionClient {
     }
     const rdpUrl = SubscriptionClient.describeTerminalUrl(sandbox);
     // Do not log the URL itself — it can contain credentials in query params.
-    logger.log('[SubscriptionClient] getSandboxRDPUrl resolved:', rdpUrl != null);
+    logger.log(
+      '[SubscriptionClient] getSandboxRDPUrl resolved:',
+      rdpUrl != null,
+    );
     return rdpUrl;
   }
 
@@ -150,7 +153,9 @@ export class SubscriptionClient {
             ...data,
             Result: {
               ...data.Result,
-              WindowsKey: data.Result.WindowsKey ? '<redacted>' : data.Result.WindowsKey,
+              WindowsKey: data.Result.WindowsKey
+                ? '<redacted>'
+                : data.Result.WindowsKey,
               Token: data.Result.Token ? '<redacted>' : data.Result.Token,
             },
           }

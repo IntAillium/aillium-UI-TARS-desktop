@@ -4,6 +4,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { jwtVerify } from 'jose';
 import { server as ipcServer } from '@main/ipcRoutes';
 import { logger } from '@main/logger';
 import { showWindow } from '@main/window/index';
@@ -14,9 +15,11 @@ import { checkBrowserAvailability } from './browserCheck';
 import { NutJSElectronOperator } from '../agent/operator';
 import { ProxyClient, RemoteComputer } from '../remote/proxyClient';
 import { RemoteComputerOperator } from '../remote/operators';
+import type { ExecuteParams } from '@ui-tars/sdk/core';
 import {
   DefaultBrowserOperator,
   RemoteBrowserOperator,
+  SearchEngine,
 } from '@ui-tars/operator-browser';
 
 type DesktopSurface = 'remote_browser' | 'local_browser' | 'local_computer';
@@ -49,6 +52,13 @@ const DESKTOP_RPC_TOKEN =
   process.env.AILLIUM_UI_TARS_DESKTOP_BRIDGE_TOKEN?.trim() ||
   process.env.AILLIUM_DESKTOP_BRIDGE_TOKEN?.trim() ||
   '';
+
+// Dedicated secret for verifying Aillium per-user pairing tokens (never the
+// login JWT_SECRET). When set, a valid pairing JWT authorizes the caller in
+// addition to the static bridge token, so a provisioned per-user install works
+// without sharing one static token across every machine.
+const DESKTOP_PAIRING_SECRET =
+  process.env.AILLIUM_DESKTOP_PAIRING_SECRET?.trim() || '';
 
 const CAPABILITIES: CapabilityDescriptor[] = [
   {
@@ -187,12 +197,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body));
 }
 
-function isAuthorized(req: IncomingMessage) {
-  if (!DESKTOP_RPC_TOKEN) {
-    // No token configured — reject all requests to prevent unauthenticated access
-    return false;
-  }
-
+function readPresentedToken(req: IncomingMessage) {
   const authorization =
     typeof req.headers.authorization === 'string'
       ? req.headers.authorization
@@ -204,9 +209,39 @@ function isAuthorized(req: IncomingMessage) {
     typeof req.headers['x-aillium-desktop-token'] === 'string'
       ? req.headers['x-aillium-desktop-token'].trim()
       : '';
-  const presented = bearerToken || headerToken;
+  return bearerToken || headerToken;
+}
 
-  return presented.length > 0 && presented === DESKTOP_RPC_TOKEN;
+async function isValidPairingToken(token: string) {
+  if (!DESKTOP_PAIRING_SECRET) {
+    return false;
+  }
+  try {
+    const { payload } = await jwtVerify(
+      token,
+      new TextEncoder().encode(DESKTOP_PAIRING_SECRET),
+      { audience: 'aillium-desktop' },
+    );
+    return payload.purpose === 'desktop-pairing';
+  } catch {
+    return false;
+  }
+}
+
+async function isAuthorized(req: IncomingMessage) {
+  // The bridge can control the desktop, so fail closed even on a local bind.
+  if (!DESKTOP_RPC_TOKEN && !DESKTOP_PAIRING_SECRET) {
+    return false;
+  }
+
+  const presented = readPresentedToken(req);
+  if (!presented) {
+    return false;
+  }
+  if (DESKTOP_RPC_TOKEN && presented === DESKTOP_RPC_TOKEN) {
+    return true;
+  }
+  return isValidPairingToken(presented);
 }
 
 async function readJsonBody(
@@ -238,6 +273,22 @@ function createOperatorBox(x1: number, y1: number, x2: number, y2: number) {
   return `[${Math.round(x1)}, ${Math.round(y1)}, ${Math.round(x2)}, ${Math.round(y2)}]`;
 }
 
+function createExecuteParams(
+  parsedPrediction: unknown,
+  screenWidth: number,
+  screenHeight: number,
+  scaleFactor: number,
+): ExecuteParams {
+  return {
+    prediction: '',
+    parsedPrediction: parsedPrediction as ExecuteParams['parsedPrediction'],
+    screenWidth,
+    screenHeight,
+    scaleFactor,
+    factors: [1, 1],
+  };
+}
+
 function resolveSurface(value: unknown): DesktopSurface {
   return value === 'remote_browser' ||
     value === 'local_browser' ||
@@ -261,12 +312,19 @@ function mapSurfaceToOperator(surface: DesktopSurface): Operator {
 async function getLocalBrowserOperator() {
   await checkBrowserAvailability();
   const settings = SettingStore.getStore();
+  const configuredSearchEngine =
+    settings.searchEngineForBrowser ?? SearchEngineForSettings.GOOGLE;
+  const searchEngine = {
+    [SearchEngineForSettings.GOOGLE]: SearchEngine.GOOGLE,
+    [SearchEngineForSettings.BAIDU]: SearchEngine.BAIDU,
+    [SearchEngineForSettings.BING]: SearchEngine.BING,
+  }[configuredSearchEngine];
   return DefaultBrowserOperator.getInstance(
     false,
     false,
     false,
     true,
-    settings.searchEngineForBrowser ?? SearchEngineForSettings.GOOGLE,
+    searchEngine,
   );
 }
 
@@ -302,7 +360,7 @@ async function executeBrowserAction(
       : await getLocalBrowserOperator();
 
   if (action === 'screen.capture') {
-    return await (operator as any).screenshot();
+    return await operator.screenshot();
   }
 
   const parsedPrediction =
@@ -343,12 +401,9 @@ async function executeBrowserAction(
     throw new Error(`Unsupported browser action: ${action}`);
   }
 
-  return await (operator as any).execute({
-    parsedPrediction,
-    screenWidth: 1920,
-    screenHeight: 1080,
-    scaleFactor: 1,
-  } as any);
+  return await operator.execute(
+    createExecuteParams(parsedPrediction, 1920, 1080, 1),
+  );
 }
 
 async function executeLocalComputerAction(
@@ -436,12 +491,14 @@ async function executeLocalComputerAction(
     throw new Error(`Unsupported local computer action: ${action}`);
   }
 
-  return await operator.execute({
-    parsedPrediction,
-    screenWidth: display.physicalSize.width,
-    screenHeight: display.physicalSize.height,
-    scaleFactor: display.scaleFactor,
-  } as any);
+  return await operator.execute(
+    createExecuteParams(
+      parsedPrediction,
+      display.physicalSize.width,
+      display.physicalSize.height,
+      display.scaleFactor,
+    ),
+  );
 }
 
 async function executeRemoteComputerAction(
@@ -520,17 +577,19 @@ async function executeRemoteComputerAction(
 
   if (action === 'input.hotkey') {
     const operator = await RemoteComputerOperator.create();
-    return await operator.execute({
-      parsedPrediction: {
-        action_type: 'hotkey',
-        action_inputs: {
-          key: readString(args.key) ?? readString(args.hotkey) ?? '',
+    return await operator.execute(
+      createExecuteParams(
+        {
+          action_type: 'hotkey',
+          action_inputs: {
+            key: readString(args.key) ?? readString(args.hotkey) ?? '',
+          },
         },
-      },
-      screenWidth: 1,
-      screenHeight: 1,
-      scaleFactor: 1,
-    } as any);
+        1,
+        1,
+        1,
+      ),
+    );
   }
 
   throw new Error(`Unsupported remote computer action: ${action}`);
@@ -661,7 +720,7 @@ export function startDesktopRpcBridge() {
       return;
     }
 
-    if (!isAuthorized(req)) {
+    if (!(await isAuthorized(req))) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
     }

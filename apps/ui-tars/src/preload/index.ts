@@ -51,7 +51,9 @@ const electronHandler = {
       const subscription = (_: IpcRendererEvent, state: LocalStore) =>
         callback(state);
       ipcRenderer.on('setting-updated', subscription);
-      return () => ipcRenderer.off('setting-updated', subscription);
+      return () => {
+        ipcRenderer.off('setting-updated', subscription);
+      };
     },
   },
 };

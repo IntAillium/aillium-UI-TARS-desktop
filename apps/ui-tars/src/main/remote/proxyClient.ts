@@ -755,7 +755,10 @@ export class ProxyClient {
         }),
       });
       // Do not log raw response — rdpUrl may contain credentials in query params.
-      logger.log('[ProxyClient] Describe Sandbox Terminal URL resolved:', !!data?.rdpUrl);
+      logger.log(
+        '[ProxyClient] Describe Sandbox Terminal URL resolved:',
+        !!data?.rdpUrl,
+      );
 
       const { rdpUrl } = data;
 
