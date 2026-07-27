@@ -427,7 +427,7 @@ export class ProxyClient {
       logger.log('[ProxyClient] allocHeadfulBrowser: has been allocated');
       return null;
     }
-    const res = await instance.getAvalialeHeadfulBrowser();
+    const res = await instance.getAvailableHeadfulBrowser();
     if (res?.state === 'granted') {
       instance.currentBrowserInfo = {
         metadata: {
@@ -548,7 +548,7 @@ export class ProxyClient {
       return wsUrl;
     }
 
-    const cdpUrlNew = await this.instance.getAvaliableWsCDPUrl(browserId);
+    const cdpUrlNew = await this.instance.getAvailableWsCDPUrl(browserId);
     logger.log('[ProxyClient] getBrowserCDPUrl refresh: ', cdpUrlNew);
     if (cdpUrlNew != null) {
       (this.instance.currentBrowserInfo.data as BrowserInfo).wsUrl = cdpUrlNew;
@@ -627,7 +627,7 @@ export class ProxyClient {
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   private constructor() {}
 
-  private async getAvaliableWsCDPUrl(browserId: string) {
+  private async getAvailableWsCDPUrl(browserId: string) {
     const browsers = await this.describeBrowsers();
     return (
       browsers.find(
@@ -642,7 +642,7 @@ export class ProxyClient {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
       });
-      logger.log('[ProxyClient] avaliable Sandbox api Response:', res);
+      logger.log('[ProxyClient] available Sandbox api Response:', res);
 
       return {
         state: res.message,
@@ -650,27 +650,27 @@ export class ProxyClient {
       };
     } catch (error) {
       logger.error(
-        '[ProxyClient] avaliable Sandbox api Error:',
+        '[ProxyClient] available Sandbox api Error:',
         (error as Error).message,
       );
       throw error;
     }
   }
 
-  private async getAvalialeHeadfulBrowser(): Promise<HdfBrowserResponse | null> {
+  private async getAvailableHeadfulBrowser(): Promise<HdfBrowserResponse | null> {
     try {
       const res = await fetchWithAuth(`${BROWSER_URL}/hdf/avaliable`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
       });
-      logger.log('[ProxyClient] avaliable headful Browser api Response:', res);
+      logger.log('[ProxyClient] available headful Browser api Response:', res);
       return {
         state: res.message,
         data: res.data,
       };
     } catch (error) {
       logger.error(
-        '[ProxyClient] avaliable headful Browser api Error:',
+        '[ProxyClient] available headful Browser api Error:',
         (error as Error).message,
       );
       throw error;
@@ -754,7 +754,11 @@ export class ProxyClient {
           SandboxId: sandboxId,
         }),
       });
-      logger.log('[ProxyClient] Describe Sandbox Terminal URL Response:', data);
+      // Do not log raw response — rdpUrl may contain credentials in query params.
+      logger.log(
+        '[ProxyClient] Describe Sandbox Terminal URL resolved:',
+        !!data?.rdpUrl,
+      );
 
       const { rdpUrl } = data;
 

@@ -85,9 +85,9 @@ const initializeApp = async () => {
 
   await checkBrowserAvailability();
 
-  // if (env.isDev) {
-  await loadDevDebugTools();
-  // }
+  if (env.isDev) {
+    await loadDevDebugTools();
+  }
 
   logger.info('createTray');
   // Tray

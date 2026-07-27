@@ -89,14 +89,18 @@ export class SubscriptionClient {
       throw new Error('the sandbox is not running');
     }
     const rdpUrl = SubscriptionClient.describeTerminalUrl(sandbox);
-    logger.log('[SubscriptionClient] getSandboxRDPUrl:', rdpUrl);
+    // Do not log the URL itself — it can contain credentials in query params.
+    logger.log(
+      '[SubscriptionClient] getSandboxRDPUrl resolved:',
+      rdpUrl != null,
+    );
     return rdpUrl;
   }
 
   public static async getBrowserCDPUrl(
     browserId: string,
   ): Promise<string | null> {
-    const cdpUrlNew = await SubscriptionClient.getAvaliableWsCDPUrl(browserId);
+    const cdpUrlNew = await SubscriptionClient.getAvailableWsCDPUrl(browserId);
     logger.log('[SubscriptionClient] getBrowserCDPUrl refresh: ', cdpUrlNew);
     return cdpUrlNew;
   }
@@ -143,9 +147,22 @@ export class SubscriptionClient {
         }),
       });
 
+      // Redact WindowsKey/Token from logs — these are credentials.
+      const redactedData = data?.Result
+        ? {
+            ...data,
+            Result: {
+              ...data.Result,
+              WindowsKey: data.Result.WindowsKey
+                ? '<redacted>'
+                : data.Result.WindowsKey,
+              Token: data.Result.Token ? '<redacted>' : data.Result.Token,
+            },
+          }
+        : data;
       logger.log(
         '[SubscriptionClient] Describe Sandbox Terminal URL Response:',
-        data,
+        redactedData,
       );
 
       const urlRes: TerminalUrlResult = data.Result;
@@ -154,8 +171,6 @@ export class SubscriptionClient {
         if (urlRes.Token === null) return null;
         const token = urlRes.Token;
         const host = SubscriptionClient.vncProxyUrl.replace(/https?:\/\//, '');
-        // return `${COMPUTER_USE}/novnc/vnc.html?host=${host}&autoconnect=true&resize=on&show_dot=true&resize=remote&path=${encodeURIComponent(
-        //   `/?token=${token}`,
         return `${COMPUTER_USE_HOST}/novnc/vnc.html?host=${host}&autoconnect=true&show_dot=true&path=${encodeURIComponent(
           `/?token=${token}`,
         )}`;
@@ -164,6 +179,10 @@ export class SubscriptionClient {
         const wsUrl = urlRes.Url;
         if (urlRes.WindowsKey === null) return null;
         const password = urlRes.WindowsKey;
+        // SECURITY: The Windows RDP/Guacamole flow requires the password as a URL
+        // query parameter. URLs end up in browser history, referer headers, and
+        // any HTTP proxy logs along the path. Callers must treat this URL as a
+        // short-lived secret: never log it, never persist it, open it once.
         return `${COMPUTER_USE_HOST}/guac/index.html?url=${wsUrl}&instanceId=${sandbox.SandboxId}&ip=${sandbox.PrimaryIp}&password=${encodeURIComponent(password)}`;
       } else {
         return null;
@@ -213,7 +232,7 @@ export class SubscriptionClient {
     }
   }
 
-  private static async getAvaliableWsCDPUrl(browserId: string) {
+  private static async getAvailableWsCDPUrl(browserId: string) {
     const browsers = await SubscriptionClient.describeBrowsers();
     return (
       browsers.find(

@@ -1,4 +1,8 @@
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { jwtVerify } from 'jose';
 import { server as ipcServer } from '@main/ipcRoutes';
@@ -11,10 +15,21 @@ import { checkBrowserAvailability } from './browserCheck';
 import { NutJSElectronOperator } from '../agent/operator';
 import { ProxyClient, RemoteComputer } from '../remote/proxyClient';
 import { RemoteComputerOperator } from '../remote/operators';
-import { DefaultBrowserOperator, RemoteBrowserOperator } from '@ui-tars/operator-browser';
+import type { ExecuteParams } from '@ui-tars/sdk/core';
+import {
+  DefaultBrowserOperator,
+  RemoteBrowserOperator,
+  SearchEngine,
+} from '@ui-tars/operator-browser';
 
 type DesktopSurface = 'remote_browser' | 'local_browser' | 'local_computer';
-type CapabilityCategory = 'screen' | 'browser' | 'input' | 'computer' | 'agent' | 'remote_resource';
+type CapabilityCategory =
+  | 'screen'
+  | 'browser'
+  | 'input'
+  | 'computer'
+  | 'agent'
+  | 'remote_resource';
 
 type CapabilityDescriptor = {
   action: string;
@@ -122,7 +137,8 @@ const CAPABILITIES: CapabilityDescriptor[] = [
     action: 'computer.execute_instruction',
     surface: 'local_computer',
     category: 'computer',
-    description: 'Run a natural-language desktop instruction through the UI-TARS agent loop.',
+    description:
+      'Run a natural-language desktop instruction through the UI-TARS agent loop.',
   },
   {
     action: 'agent.run',
@@ -170,7 +186,8 @@ const CAPABILITIES: CapabilityDescriptor[] = [
     action: 'remote.get_rdp_url',
     surface: 'local_computer',
     category: 'remote_resource',
-    description: 'Get the remote desktop endpoint for the allocated computer resource.',
+    description:
+      'Get the remote desktop endpoint for the allocated computer resource.',
   },
 ];
 
@@ -182,7 +199,9 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
 
 function readPresentedToken(req: IncomingMessage) {
   const authorization =
-    typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+    typeof req.headers.authorization === 'string'
+      ? req.headers.authorization
+      : '';
   const bearerToken = authorization.startsWith('Bearer ')
     ? authorization.slice('Bearer '.length).trim()
     : '';
@@ -210,9 +229,9 @@ async function isValidPairingToken(token: string) {
 }
 
 async function isAuthorized(req: IncomingMessage) {
-  // No auth configured (local/dev): allow, matching the previous behavior.
+  // The bridge can control the desktop, so fail closed even on a local bind.
   if (!DESKTOP_RPC_TOKEN && !DESKTOP_PAIRING_SECRET) {
-    return true;
+    return false;
   }
 
   const presented = readPresentedToken(req);
@@ -225,7 +244,9 @@ async function isAuthorized(req: IncomingMessage) {
   return isValidPairingToken(presented);
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJsonBody(
+  req: IncomingMessage,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -252,8 +273,26 @@ function createOperatorBox(x1: number, y1: number, x2: number, y2: number) {
   return `[${Math.round(x1)}, ${Math.round(y1)}, ${Math.round(x2)}, ${Math.round(y2)}]`;
 }
 
+function createExecuteParams(
+  parsedPrediction: unknown,
+  screenWidth: number,
+  screenHeight: number,
+  scaleFactor: number,
+): ExecuteParams {
+  return {
+    prediction: '',
+    parsedPrediction: parsedPrediction as ExecuteParams['parsedPrediction'],
+    screenWidth,
+    screenHeight,
+    scaleFactor,
+    factors: [1, 1],
+  };
+}
+
 function resolveSurface(value: unknown): DesktopSurface {
-  return value === 'remote_browser' || value === 'local_browser' || value === 'local_computer'
+  return value === 'remote_browser' ||
+    value === 'local_browser' ||
+    value === 'local_computer'
     ? value
     : 'local_computer';
 }
@@ -273,12 +312,19 @@ function mapSurfaceToOperator(surface: DesktopSurface): Operator {
 async function getLocalBrowserOperator() {
   await checkBrowserAvailability();
   const settings = SettingStore.getStore();
+  const configuredSearchEngine =
+    settings.searchEngineForBrowser ?? SearchEngineForSettings.GOOGLE;
+  const searchEngine = {
+    [SearchEngineForSettings.GOOGLE]: SearchEngine.GOOGLE,
+    [SearchEngineForSettings.BAIDU]: SearchEngine.BAIDU,
+    [SearchEngineForSettings.BING]: SearchEngine.BING,
+  }[configuredSearchEngine];
   return DefaultBrowserOperator.getInstance(
     false,
     false,
     false,
     true,
-    settings.searchEngineForBrowser ?? SearchEngineForSettings.GOOGLE,
+    searchEngine,
   );
 }
 
@@ -286,7 +332,9 @@ async function getRemoteBrowserOperator() {
   const existingUrl = await ProxyClient.getBrowserCDPUrl();
   const cdpUrl =
     existingUrl ||
-    ((await ipcServer.allocRemoteResource({ resourceType: 'hdfBrowser' })) ? await ProxyClient.getBrowserCDPUrl() : null);
+    ((await ipcServer.allocRemoteResource({ resourceType: 'hdfBrowser' }))
+      ? await ProxyClient.getBrowserCDPUrl()
+      : null);
   if (!cdpUrl) {
     throw new Error('Remote browser resource is not available');
   }
@@ -312,14 +360,16 @@ async function executeBrowserAction(
       : await getLocalBrowserOperator();
 
   if (action === 'screen.capture') {
-    return await (operator as any).screenshot();
+    return await operator.screenshot();
   }
 
   const parsedPrediction =
     action === 'browser.navigate'
       ? {
           action_type: 'navigate',
-          action_inputs: { content: readString(args.url) ?? readString(args.target) ?? '' },
+          action_inputs: {
+            content: readString(args.url) ?? readString(args.target) ?? '',
+          },
         }
       : action === 'browser.navigate_back'
         ? {
@@ -334,12 +384,16 @@ async function executeBrowserAction(
           : action === 'input.hotkey'
             ? {
                 action_type: 'hotkey',
-                action_inputs: { key: readString(args.key) ?? readString(args.hotkey) ?? '' },
+                action_inputs: {
+                  key: readString(args.key) ?? readString(args.hotkey) ?? '',
+                },
               }
             : action === 'mouse.scroll'
               ? {
                   action_type: 'scroll',
-                  action_inputs: { direction: readString(args.direction) ?? 'down' },
+                  action_inputs: {
+                    direction: readString(args.direction) ?? 'down',
+                  },
                 }
               : null;
 
@@ -347,15 +401,15 @@ async function executeBrowserAction(
     throw new Error(`Unsupported browser action: ${action}`);
   }
 
-  return await (operator as any).execute({
-    parsedPrediction,
-    screenWidth: 1920,
-    screenHeight: 1080,
-    scaleFactor: 1,
-  } as any);
+  return await operator.execute(
+    createExecuteParams(parsedPrediction, 1920, 1080, 1),
+  );
 }
 
-async function executeLocalComputerAction(action: string, args: Record<string, unknown>) {
+async function executeLocalComputerAction(
+  action: string,
+  args: Record<string, unknown>,
+) {
   const operator = new NutJSElectronOperator();
   const display = getScreenSize();
 
@@ -371,8 +425,14 @@ async function executeLocalComputerAction(action: string, args: Record<string, u
     return await operator.screenshot();
   }
 
-  const x = readNumber(args.x) ?? readNumber(args.startX) ?? Math.round(display.physicalSize.width / 2);
-  const y = readNumber(args.y) ?? readNumber(args.startY) ?? Math.round(display.physicalSize.height / 2);
+  const x =
+    readNumber(args.x) ??
+    readNumber(args.startX) ??
+    Math.round(display.physicalSize.width / 2);
+  const y =
+    readNumber(args.y) ??
+    readNumber(args.startY) ??
+    Math.round(display.physicalSize.height / 2);
   const endX = readNumber(args.endX);
   const endY = readNumber(args.endY);
 
@@ -385,7 +445,9 @@ async function executeLocalComputerAction(action: string, args: Record<string, u
       : action === 'input.hotkey'
         ? {
             action_type: 'hotkey',
-            action_inputs: { key: readString(args.key) ?? readString(args.hotkey) ?? '' },
+            action_inputs: {
+              key: readString(args.key) ?? readString(args.hotkey) ?? '',
+            },
           }
         : action === 'mouse.click'
           ? {
@@ -429,15 +491,20 @@ async function executeLocalComputerAction(action: string, args: Record<string, u
     throw new Error(`Unsupported local computer action: ${action}`);
   }
 
-  return await operator.execute({
-    parsedPrediction,
-    screenWidth: display.physicalSize.width,
-    screenHeight: display.physicalSize.height,
-    scaleFactor: display.scaleFactor,
-  } as any);
+  return await operator.execute(
+    createExecuteParams(
+      parsedPrediction,
+      display.physicalSize.width,
+      display.physicalSize.height,
+      display.scaleFactor,
+    ),
+  );
 }
 
-async function executeRemoteComputerAction(action: string, args: Record<string, unknown>) {
+async function executeRemoteComputerAction(
+  action: string,
+  args: Record<string, unknown>,
+) {
   const remoteComputer = await getRemoteComputerClient();
 
   if (action === 'screen.get_size') {
@@ -456,7 +523,11 @@ async function executeRemoteComputerAction(action: string, args: Record<string, 
     return { ok: true };
   }
 
-  if (action === 'mouse.click' || action === 'mouse.double_click' || action === 'mouse.right_click') {
+  if (
+    action === 'mouse.click' ||
+    action === 'mouse.double_click' ||
+    action === 'mouse.right_click'
+  ) {
     const x = readNumber(args.x);
     const y = readNumber(args.y);
     if (x === null || y === null) {
@@ -465,7 +536,11 @@ async function executeRemoteComputerAction(action: string, args: Record<string, 
     await remoteComputer.clickMouse(
       x,
       y,
-      action === 'mouse.double_click' ? 'DoubleLeft' : action === 'mouse.right_click' ? 'Right' : 'Left',
+      action === 'mouse.double_click'
+        ? 'DoubleLeft'
+        : action === 'mouse.right_click'
+          ? 'Right'
+          : 'Left',
       true,
       true,
     );
@@ -502,15 +577,19 @@ async function executeRemoteComputerAction(action: string, args: Record<string, 
 
   if (action === 'input.hotkey') {
     const operator = await RemoteComputerOperator.create();
-    return await operator.execute({
-      parsedPrediction: {
-        action_type: 'hotkey',
-        action_inputs: { key: readString(args.key) ?? readString(args.hotkey) ?? '' },
-      },
-      screenWidth: 1,
-      screenHeight: 1,
-      scaleFactor: 1,
-    } as any);
+    return await operator.execute(
+      createExecuteParams(
+        {
+          action_type: 'hotkey',
+          action_inputs: {
+            key: readString(args.key) ?? readString(args.hotkey) ?? '',
+          },
+        },
+        1,
+        1,
+        1,
+      ),
+    );
   }
 
   throw new Error(`Unsupported remote computer action: ${action}`);
@@ -524,7 +603,9 @@ async function performAction(body: Record<string, unknown>) {
 
   const requestedSurface = resolveSurface(body.requestedSurface);
   const args =
-    body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments)
+    body.arguments &&
+    typeof body.arguments === 'object' &&
+    !Array.isArray(body.arguments)
       ? (body.arguments as Record<string, unknown>)
       : {};
 
@@ -537,7 +618,10 @@ async function performAction(body: Record<string, unknown>) {
     case 'input.hotkey':
     case 'mouse.scroll':
     case 'screen.capture':
-      if (requestedSurface === 'remote_browser' || requestedSurface === 'local_browser') {
+      if (
+        requestedSurface === 'remote_browser' ||
+        requestedSurface === 'local_browser'
+      ) {
         return await executeBrowserAction(requestedSurface, action, args);
       }
       if (requestedSurface === 'local_computer') {
@@ -553,7 +637,8 @@ async function performAction(body: Record<string, unknown>) {
         ? await executeLocalComputerAction(action, args)
         : await executeRemoteComputerAction(action, args);
     case 'computer.execute_instruction': {
-      const instructions = readString(args.prompt) ?? readString(args.instructions);
+      const instructions =
+        readString(args.prompt) ?? readString(args.instructions);
       if (!instructions) {
         throw new Error('prompt or instructions is required');
       }
@@ -563,7 +648,8 @@ async function performAction(body: Record<string, unknown>) {
       return { ok: true, instructions };
     }
     case 'agent.run': {
-      const instructions = readString(args.prompt) ?? readString(args.instructions);
+      const instructions =
+        readString(args.prompt) ?? readString(args.instructions);
       if (instructions) {
         await ipcServer.setInstructions({ instructions });
       }
@@ -583,17 +669,23 @@ async function performAction(body: Record<string, unknown>) {
       await ipcServer.stopRun();
       return { ok: true };
     case 'remote.allocate_browser':
-      return await ipcServer.allocRemoteResource({ resourceType: 'hdfBrowser' });
+      return await ipcServer.allocRemoteResource({
+        resourceType: 'hdfBrowser',
+      });
     case 'remote.allocate_computer':
       return await ipcServer.allocRemoteResource({ resourceType: 'computer' });
     case 'remote.release_resource': {
       const resourceType =
-        readString(args.resourceType) === 'computer' ? 'computer' : 'hdfBrowser';
+        readString(args.resourceType) === 'computer'
+          ? 'computer'
+          : 'hdfBrowser';
       return await ipcServer.releaseRemoteResource({ resourceType });
     }
     case 'remote.get_rdp_url': {
       const resourceType =
-        readString(args.resourceType) === 'hdfBrowser' ? 'hdfBrowser' : 'computer';
+        readString(args.resourceType) === 'hdfBrowser'
+          ? 'hdfBrowser'
+          : 'computer';
       return await ipcServer.getRemoteResourceRDPUrl({ resourceType });
     }
     default:
@@ -614,6 +706,12 @@ function buildCapabilitiesPayload() {
 }
 
 export function startDesktopRpcBridge() {
+  if (!DESKTOP_RPC_TOKEN) {
+    logger.warn(
+      '[desktop-rpc-bridge] Desktop RPC bridge disabled: AILLIUM_DESKTOP_BRIDGE_TOKEN not configured. All requests will be rejected until a token is set.',
+    );
+  }
+
   const httpServer = createHttpServer(async (req, res) => {
     const requestPath = req.url?.split('?')[0] ?? '/';
 
@@ -668,7 +766,8 @@ export function startDesktopRpcBridge() {
     } catch (error) {
       logger.error('[desktop-rpc-bridge]', error);
       sendJson(res, 400, {
-        error: error instanceof Error ? error.message : 'Desktop RPC bridge error',
+        error:
+          error instanceof Error ? error.message : 'Desktop RPC bridge error',
       });
     }
   });

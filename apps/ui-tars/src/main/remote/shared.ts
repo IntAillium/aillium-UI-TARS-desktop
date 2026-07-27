@@ -50,7 +50,9 @@ export abstract class BaseRemoteComputer {
   abstract takeScreenshot(): Promise<string>;
 }
 
-const UI_TARS_PROXY_HOST = '';
+// Read host URLs from environment so remote operators are functional out of the box
+// once configured. An empty string still works for local development.
+const UI_TARS_PROXY_HOST = process.env.UI_TARS_PROXY_HOST ?? '';
 
 const VER = '/api/v1';
 const REGISTER_URL = `${UI_TARS_PROXY_HOST}${VER}/register`;
@@ -59,7 +61,7 @@ const BROWSER_URL = `${UI_TARS_PROXY_HOST}${VER}/browsers`;
 const TIME_URL = `${UI_TARS_PROXY_HOST}${VER}/time-balance`;
 const FREE_MODEL_BASE_URL = `${UI_TARS_PROXY_HOST}${VER}`;
 
-const COMPUTER_USE_HOST = '';
+const COMPUTER_USE_HOST = process.env.UI_TARS_COMPUTER_USE_HOST ?? '';
 
 export {
   UI_TARS_PROXY_HOST,
