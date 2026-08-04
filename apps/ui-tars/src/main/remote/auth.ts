@@ -41,6 +41,7 @@ async function fetchWithRetry(
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     return response.json();
   } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason ?? error;
     if (retries <= 0) throw error;
     logger.error(`[Auth] Retrying request...`);
     return fetchWithRetry(url, options, retries - 1);
@@ -197,7 +198,8 @@ async function getLocalPrivKey(format: 'base64' | 'origin'): Promise<string> {
   return privateKeyBase64;
 }
 
-async function registerDevice(): Promise<boolean> {
+async function registerDevice(signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) throw signal.reason;
   const { publicKey: devicePublicKey } = await genKeyPair();
   const deviceId = await getDeviceId();
   const ts = Date.now();
@@ -212,10 +214,12 @@ async function registerDevice(): Promise<boolean> {
   })
     .setProtectedHeader({ alg: ALGO })
     .sign(appPrivateKey);
+  if (signal?.aborted) throw signal.reason;
 
   try {
     const data = await fetchWithRetry(REGISTER_URL, {
       method: 'POST',
+      signal,
       headers: {
         'Content-Type': 'application/json',
         'X-Device-Id': await getDeviceId(),

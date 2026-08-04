@@ -30,10 +30,16 @@ class FetchError extends Error {
   }
 }
 
-async function fetchWithAuth(
+type RemoteFetchDependencies = {
+  fetch: typeof fetch;
+  getAuthHeader: typeof getAuthHeader;
+};
+
+export async function fetchWithAuth(
   url: string,
   options: RequestInit,
   retries = 1,
+  dependencies: RemoteFetchDependencies = { fetch, getAuthHeader },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<any> {
   let xRequestId: string | null = 'undefined';
@@ -41,11 +47,13 @@ async function fetchWithAuth(
     if (!options.headers) {
       options.headers = {};
     }
-    const authHeader = await getAuthHeader();
+    const authHeader = await dependencies.getAuthHeader();
+    if (options.signal?.aborted) throw options.signal.reason;
     Object.assign(options.headers, {
       ...authHeader,
     });
-    const response = await fetch(url, options);
+    const response = await dependencies.fetch(url, options);
+    if (options.signal?.aborted) throw options.signal.reason;
     xRequestId = response.headers.get('x-request-id');
 
     if (!response.ok) {
@@ -57,20 +65,25 @@ async function fetchWithAuth(
     }
 
     const data = await response.json();
+    if (options.signal?.aborted) throw options.signal.reason;
     return data;
   } catch (error) {
+    if (options.signal?.aborted) throw options.signal.reason ?? error;
     if (retries <= 0) throw error;
     logger.error(
       `[proxyClient] Retrying request..., xRequestId: ${xRequestId}`,
     );
-    return fetchWithAuth(url, options, retries - 1);
+    return fetchWithAuth(url, options, retries - 1, dependencies);
   }
 }
 
 export class RemoteComputer extends BaseRemoteComputer {
   private instanceId = '';
 
-  constructor(instanceId: string) {
+  constructor(
+    instanceId: string,
+    private readonly signal?: AbortSignal,
+  ) {
     super();
     this.instanceId = instanceId;
   }
@@ -79,6 +92,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/MoveMouse`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -106,6 +120,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/ClickMouse`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -135,6 +150,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/DragMouse`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -158,6 +174,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/PressKey`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -178,6 +195,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/TypeText`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -203,6 +221,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/Scroll`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -223,6 +242,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/GetScreenSize`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -250,6 +270,7 @@ export class RemoteComputer extends BaseRemoteComputer {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/TakeScreenshot`, {
         method: 'POST',
+        signal: this.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           InstanceId: this.instanceId,
@@ -372,10 +393,10 @@ export type HdfBrowserResponse =
 export class ProxyClient {
   private static instance: ProxyClient;
 
-  public static async getInstance(): Promise<ProxyClient> {
+  public static async getInstance(signal?: AbortSignal): Promise<ProxyClient> {
     if (!ProxyClient.instance) {
       // Register device before get instance
-      const registerResult = await registerDevice();
+      const registerResult = await registerDevice(signal);
       if (!registerResult) {
         throw new Error('Register device failed');
       }
@@ -386,8 +407,9 @@ export class ProxyClient {
 
   public static async allocResource(
     resourceType: 'computer' | 'hdfBrowser',
+    signal?: AbortSignal,
   ): Promise<AvailableResponse | null> {
-    const instance = await ProxyClient.getInstance();
+    const instance = await ProxyClient.getInstance(signal);
 
     const currentTimeStamp = Date.now();
     if (resourceType === 'computer') {
@@ -399,7 +421,7 @@ export class ProxyClient {
         );
         return null;
       }
-      const res = await instance.getAvalialeSandbox();
+      const res = await instance.getAvalialeSandbox(signal);
       if (res?.state === 'granted') {
         instance.currentSandboxInfo = {
           metadata: {
@@ -412,13 +434,15 @@ export class ProxyClient {
       }
       return res;
     } else if (resourceType === 'hdfBrowser') {
-      return this.allocHeadfulBrowser();
+      return this.allocHeadfulBrowser(signal);
     }
     return null;
   }
 
-  public static async allocHeadfulBrowser(): Promise<HdfBrowserResponse | null> {
-    const instance = await ProxyClient.getInstance();
+  public static async allocHeadfulBrowser(
+    signal?: AbortSignal,
+  ): Promise<HdfBrowserResponse | null> {
+    const instance = await ProxyClient.getInstance(signal);
 
     const currentTimeStamp = Date.now();
     const needAllocate =
@@ -427,7 +451,7 @@ export class ProxyClient {
       logger.log('[ProxyClient] allocHeadfulBrowser: has been allocated');
       return null;
     }
-    const res = await instance.getAvailableHeadfulBrowser();
+    const res = await instance.getAvailableHeadfulBrowser(signal);
     if (res?.state === 'granted') {
       instance.currentBrowserInfo = {
         metadata: {
@@ -443,6 +467,7 @@ export class ProxyClient {
 
   public static async releaseResource(
     resourceType: 'computer' | 'hdfBrowser',
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (!ProxyClient.instance) {
       logger.log(
@@ -451,7 +476,7 @@ export class ProxyClient {
       return true;
     }
 
-    const instance = await ProxyClient.getInstance();
+    const instance = await ProxyClient.getInstance(signal);
 
     // const currentTimeStamp = Date.now();
     if (resourceType === 'computer') {
@@ -463,7 +488,7 @@ export class ProxyClient {
       }
       // const sandboxId = instance.sandboxInfo.sandBoxId;
       // await instance.deleteSandbox(sandboxId);
-      const result = await instance.releaseSandbox();
+      const result = await instance.releaseSandbox(signal);
       instance.currentSandboxInfo = null;
       logger.log('[ProxyClient] release sandboxInfo:', result);
       return result;
@@ -479,7 +504,7 @@ export class ProxyClient {
       const browserData = instance.currentBrowserInfo.data;
       const sandboxId =
         'sandboxId' in browserData ? browserData.sandboxId : null;
-      const result = await instance.releaseHdfBrowser(sandboxId);
+      const result = await instance.releaseHdfBrowser(sandboxId, signal);
       instance.currentBrowserInfo = null;
       logger.log('[ProxyClient] release browser:', result);
       return result;
@@ -490,6 +515,7 @@ export class ProxyClient {
   }
 
   public static async getSandboxInfo(): Promise<SandboxInfo | null> {
+    if (!this.instance) return null;
     const currentTimeStamp = Date.now();
     if (
       currentTimeStamp - this.instance.lastSandboxAllocTs >
@@ -522,17 +548,23 @@ export class ProxyClient {
     return browserInfo.data as BrowserInfo;
   }
 
-  public static async getSandboxRDPUrl(): Promise<string | null> {
+  public static async getSandboxRDPUrl(
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    if (!this.instance) return null;
     if (!this.instance.currentSandboxInfo) {
       return null;
     }
     const sandboxId = this.instance.currentSandboxInfo.data.sandBoxId;
-    const rdpUrl = this.instance.describeSandboxTerminalUrl(sandboxId);
+    const rdpUrl = this.instance.describeSandboxTerminalUrl(sandboxId, signal);
     logger.log('[ProxyClient] getSandboxRDPUrl successful');
     return rdpUrl;
   }
 
-  public static async getBrowserCDPUrl(): Promise<string | null> {
+  public static async getBrowserCDPUrl(
+    signal?: AbortSignal,
+  ): Promise<string | null> {
+    if (!this.instance) return null;
     if (!this.instance.currentBrowserInfo) {
       return null;
     }
@@ -548,7 +580,10 @@ export class ProxyClient {
       return wsUrl;
     }
 
-    const cdpUrlNew = await this.instance.getAvailableWsCDPUrl(browserId);
+    const cdpUrlNew = await this.instance.getAvailableWsCDPUrl(
+      browserId,
+      signal,
+    );
     logger.log('[ProxyClient] getBrowserCDPUrl refresh: ', cdpUrlNew);
     if (cdpUrlNew != null) {
       (this.instance.currentBrowserInfo.data as BrowserInfo).wsUrl = cdpUrlNew;
@@ -627,8 +662,8 @@ export class ProxyClient {
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   private constructor() {}
 
-  private async getAvailableWsCDPUrl(browserId: string) {
-    const browsers = await this.describeBrowsers();
+  private async getAvailableWsCDPUrl(browserId: string, signal?: AbortSignal) {
+    const browsers = await this.describeBrowsers(signal);
     return (
       browsers.find(
         (browser) => browser.status === 'ready' && browser.id === browserId,
@@ -636,10 +671,13 @@ export class ProxyClient {
     );
   }
 
-  private async getAvalialeSandbox(): Promise<SandboxResponse | null> {
+  private async getAvalialeSandbox(
+    signal?: AbortSignal,
+  ): Promise<SandboxResponse | null> {
     try {
       const res = await fetchWithAuth(`${PROXY_URL}/avaliable`, {
         method: 'GET',
+        signal,
         headers: { 'Content-Type': 'application/json' },
       });
       logger.log('[ProxyClient] available Sandbox api Response:', res);
@@ -657,10 +695,13 @@ export class ProxyClient {
     }
   }
 
-  private async getAvailableHeadfulBrowser(): Promise<HdfBrowserResponse | null> {
+  private async getAvailableHeadfulBrowser(
+    signal?: AbortSignal,
+  ): Promise<HdfBrowserResponse | null> {
     try {
       const res = await fetchWithAuth(`${BROWSER_URL}/hdf/avaliable`, {
         method: 'GET',
+        signal,
         headers: { 'Content-Type': 'application/json' },
       });
       logger.log('[ProxyClient] available headful Browser api Response:', res);
@@ -677,7 +718,7 @@ export class ProxyClient {
     }
   }
 
-  private async releaseSandbox(): Promise<boolean> {
+  private async releaseSandbox(signal?: AbortSignal): Promise<boolean> {
     const sandboxId = this.currentSandboxInfo?.data.sandBoxId;
     if (!sandboxId) {
       logger.warn('[ProxyClient] releaseSandbox: sandboxId is null');
@@ -687,6 +728,7 @@ export class ProxyClient {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/release`, {
         method: 'POST',
+        signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           SandboxId: sandboxId,
@@ -703,13 +745,17 @@ export class ProxyClient {
     }
   }
 
-  private async releaseHdfBrowser(sandBoxId: string | null): Promise<boolean> {
+  private async releaseHdfBrowser(
+    sandBoxId: string | null,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     if (!sandBoxId) {
       return true;
     }
     try {
       const data = await fetchWithAuth(`${BROWSER_URL}/hdf/release`, {
         method: 'POST',
+        signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           SandboxId: sandBoxId,
@@ -745,10 +791,14 @@ export class ProxyClient {
     }
   }
 
-  private async describeSandboxTerminalUrl(sandboxId: string) {
+  private async describeSandboxTerminalUrl(
+    sandboxId: string,
+    signal?: AbortSignal,
+  ) {
     try {
       const data = await fetchWithAuth(`${PROXY_URL}/rdp`, {
         method: 'POST',
+        signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           SandboxId: sandboxId,
@@ -772,10 +822,11 @@ export class ProxyClient {
     }
   }
 
-  private async describeBrowsers(): Promise<Browser[]> {
+  private async describeBrowsers(signal?: AbortSignal): Promise<Browser[]> {
     try {
       const data = await fetchWithAuth(`${BROWSER_URL}`, {
         method: 'GET',
+        signal,
         headers: { 'Content-Type': 'application/json' },
       });
       logger.log('[ProxyClient] Describe Browsers Response:', data);

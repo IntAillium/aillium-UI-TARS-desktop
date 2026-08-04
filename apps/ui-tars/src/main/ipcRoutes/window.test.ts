@@ -6,6 +6,9 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 vi.mock('@main/window', () => ({
   showWindow: vi.fn(),
 }));
+vi.mock('@main/window/createWindow', () => ({
+  appUpdater: null,
+}));
 
 describe('windowRoute.showMainWindow', () => {
   beforeEach(() => {
@@ -15,7 +18,7 @@ describe('windowRoute.showMainWindow', () => {
   it('should call showWindow function', async () => {
     await windowRoute.showMainWindow.handle({
       input: undefined,
-      context: {} as any,
+      context: {} as never,
     });
 
     expect(showWindow).toHaveBeenCalled();
@@ -25,29 +28,29 @@ describe('windowRoute.showMainWindow', () => {
   it('should handle showWindow being called multiple times', async () => {
     await windowRoute.showMainWindow.handle({
       input: undefined,
-      context: {} as any,
+      context: {} as never,
     });
     await windowRoute.showMainWindow.handle({
       input: undefined,
-      context: {} as any,
+      context: {} as never,
     });
     await windowRoute.showMainWindow.handle({
       input: undefined,
-      context: {} as any,
+      context: {} as never,
     });
 
     expect(showWindow).toHaveBeenCalledTimes(3);
   });
 
   it('should handle errors from showWindow', async () => {
-    (showWindow as any).mockImplementationOnce(() => {
+    vi.mocked(showWindow).mockImplementationOnce(() => {
       throw new Error('Failed to show window');
     });
 
     await expect(
       windowRoute.showMainWindow.handle({
         input: undefined,
-        context: {} as any,
+        context: {} as never,
       }),
     ).rejects.toThrow('Failed to show window');
   });

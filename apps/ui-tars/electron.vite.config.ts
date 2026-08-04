@@ -27,9 +27,18 @@ export default defineConfig({
       outDir: 'dist/main',
       lib: {
         entry: './src/main/main.ts',
+        formats: ['cjs'],
       },
       rollupOptions: {
+        input: {
+          main: resolve('./src/main/main.ts'),
+          desktopActionWorker: resolve(
+            './src/main/workers/desktopActionWorker.ts',
+          ),
+        },
         output: {
+          format: 'cjs',
+          entryFileNames: '[name].js',
           manualChunks(id): string | void {
             // IMPORTANT: can't change the name of the chunk, avoid private key leak
             if (id.includes('app_private')) {
@@ -42,7 +51,9 @@ export default defineConfig({
     plugins: [
       bytecodePlugin({
         chunkAlias: 'app_private',
-        protectedStrings: [process.env.UI_TARS_APP_PRIVATE_KEY_BASE64!],
+        protectedStrings: process.env.UI_TARS_APP_PRIVATE_KEY_BASE64
+          ? [process.env.UI_TARS_APP_PRIVATE_KEY_BASE64]
+          : [],
       }),
       tsconfigPaths(),
       externalizeDepsPlugin({

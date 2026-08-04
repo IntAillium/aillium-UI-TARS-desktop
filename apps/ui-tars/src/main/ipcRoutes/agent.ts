@@ -74,7 +74,11 @@ export const agentRoute = t.router({
   }),
   stopRun: t.procedure.input<void>().handle(async () => {
     const { abortController } = store.getState();
-    store.setState({ status: StatusEnum.END, thinking: false });
+    store.setState({
+      status: StatusEnum.END,
+      thinking: false,
+      abortController: null,
+    });
 
     showWindow();
 
@@ -84,6 +88,7 @@ export const agentRoute = t.router({
       guiAgent.resume();
       guiAgent.stop();
     }
+    GUIAgentManager.getInstance().clearAgent();
 
     closeScreenMarker();
   }),

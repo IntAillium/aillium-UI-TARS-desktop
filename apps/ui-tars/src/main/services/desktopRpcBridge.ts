@@ -4,25 +4,36 @@ import {
   type ServerResponse,
 } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { jwtVerify } from 'jose';
 import { server as ipcServer } from '@main/ipcRoutes';
+import { GUIAgentManager } from '@main/ipcRoutes/agent';
 import { logger } from '@main/logger';
+import { store } from '@main/store/create';
 import { showWindow } from '@main/window/index';
 import { getScreenSize } from '@main/utils/screen';
 import { SettingStore } from '@main/store/setting';
 import { Operator, SearchEngineForSettings } from '@main/store/types';
 import { checkBrowserAvailability } from './browserCheck';
-import { NutJSElectronOperator } from '../agent/operator';
-import { ProxyClient, RemoteComputer } from '../remote/proxyClient';
-import { RemoteComputerOperator } from '../remote/operators';
-import type { ExecuteParams } from '@ui-tars/sdk/core';
+import { getAuthHeader } from '../remote/auth';
+import { ProxyClient } from '../remote/proxyClient';
 import {
-  DefaultBrowserOperator,
-  RemoteBrowserOperator,
-  SearchEngine,
-} from '@ui-tars/operator-browser';
+  assertDesktopControlTarget,
+  DesktopControlError,
+  DesktopControlSessionRegistry,
+  readDesktopControlTarget,
+  verifyDesktopControlToken,
+  type DesktopControlIdentity,
+} from './desktopControlSessions';
+import { IsolatedDesktopAction } from './desktopActionProcess';
+import {
+  isGovernedAgentSurface,
+  resolveFencedMeshGateway,
+} from './desktopActionPolicy';
 
-type DesktopSurface = 'remote_browser' | 'local_browser' | 'local_computer';
+type DesktopSurface =
+  | 'remote_browser'
+  | 'remote_computer'
+  | 'local_browser'
+  | 'local_computer';
 type CapabilityCategory =
   | 'screen'
   | 'browser'
@@ -48,17 +59,20 @@ const DESKTOP_RPC_HOST =
   process.env.AILLIUM_UI_TARS_DESKTOP_BRIDGE_HOST?.trim() ||
   process.env.AILLIUM_DESKTOP_BRIDGE_HOST?.trim() ||
   '127.0.0.1';
-const DESKTOP_RPC_TOKEN =
-  process.env.AILLIUM_UI_TARS_DESKTOP_BRIDGE_TOKEN?.trim() ||
-  process.env.AILLIUM_DESKTOP_BRIDGE_TOKEN?.trim() ||
-  '';
-
-// Dedicated secret for verifying Aillium per-user pairing tokens (never the
-// login JWT_SECRET). When set, a valid pairing JWT authorizes the caller in
-// addition to the static bridge token, so a provisioned per-user install works
-// without sharing one static token across every machine.
-const DESKTOP_PAIRING_SECRET =
-  process.env.AILLIUM_DESKTOP_PAIRING_SECRET?.trim() || '';
+// Dedicated secret for verifying short-lived, run-scoped desktop-control JWTs
+// (never the login JWT_SECRET). An unscoped pairing token is not control
+// authority; it must be exchanged for a scoped token by the durable runtime.
+const DESKTOP_AUTHORITY_PUBLIC_KEY = (() => {
+  const encoded =
+    process.env.AILLIUM_DESKTOP_AUTHORITY_PUBLIC_KEY_BASE64?.trim() || '';
+  if (!encoded) return '';
+  try {
+    return Buffer.from(encoded, 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+})();
+const desktopSessions = new DesktopControlSessionRegistry();
 
 const CAPABILITIES: CapabilityDescriptor[] = [
   {
@@ -212,36 +226,29 @@ function readPresentedToken(req: IncomingMessage) {
   return bearerToken || headerToken;
 }
 
-async function isValidPairingToken(token: string) {
-  if (!DESKTOP_PAIRING_SECRET) {
-    return false;
-  }
-  try {
-    const { payload } = await jwtVerify(
-      token,
-      new TextEncoder().encode(DESKTOP_PAIRING_SECRET),
-      { audience: 'aillium-desktop' },
-    );
-    return payload.purpose === 'desktop-pairing';
-  } catch {
-    return false;
-  }
-}
-
-async function isAuthorized(req: IncomingMessage) {
+async function authorizeRequest(
+  req: IncomingMessage,
+  // secretlint-disable-next-line @secretlint/secretlint-rule-pattern -- return type names a runtime value, not an embedded secret
+): Promise<{ identity: DesktopControlIdentity; token: string } | null> {
   // The bridge can control the desktop, so fail closed even on a local bind.
-  if (!DESKTOP_RPC_TOKEN && !DESKTOP_PAIRING_SECRET) {
-    return false;
+  if (!DESKTOP_AUTHORITY_PUBLIC_KEY) {
+    return null;
   }
 
   const presented = readPresentedToken(req);
   if (!presented) {
-    return false;
+    return null;
   }
-  if (DESKTOP_RPC_TOKEN && presented === DESKTOP_RPC_TOKEN) {
-    return true;
+  try {
+    const identity = await verifyDesktopControlToken(
+      presented,
+      DESKTOP_AUTHORITY_PUBLIC_KEY,
+    );
+    // secretlint-disable-next-line @secretlint/secretlint-rule-pattern -- forwards a verified runtime bearer value
+    return { identity, token: presented };
+  } catch {
+    return null;
   }
-  return isValidPairingToken(presented);
 }
 
 async function readJsonBody(
@@ -259,38 +266,9 @@ function readString(value: unknown) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function readNumber(value: unknown) {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function createPointBox(x: number, y: number) {
-  const cx = Math.max(1, Math.round(x));
-  const cy = Math.max(1, Math.round(y));
-  return `[${cx}, ${cy}, ${cx}, ${cy}]`;
-}
-
-function createOperatorBox(x1: number, y1: number, x2: number, y2: number) {
-  return `[${Math.round(x1)}, ${Math.round(y1)}, ${Math.round(x2)}, ${Math.round(y2)}]`;
-}
-
-function createExecuteParams(
-  parsedPrediction: unknown,
-  screenWidth: number,
-  screenHeight: number,
-  scaleFactor: number,
-): ExecuteParams {
-  return {
-    prediction: '',
-    parsedPrediction: parsedPrediction as ExecuteParams['parsedPrediction'],
-    screenWidth,
-    screenHeight,
-    scaleFactor,
-    factors: [1, 1],
-  };
-}
-
 function resolveSurface(value: unknown): DesktopSurface {
   return value === 'remote_browser' ||
+    value === 'remote_computer' ||
     value === 'local_browser' ||
     value === 'local_computer'
     ? value
@@ -301,6 +279,8 @@ function mapSurfaceToOperator(surface: DesktopSurface): Operator {
   switch (surface) {
     case 'remote_browser':
       return Operator.RemoteBrowser;
+    case 'remote_computer':
+      return Operator.RemoteComputer;
     case 'local_browser':
       return Operator.LocalBrowser;
     case 'local_computer':
@@ -309,388 +289,295 @@ function mapSurfaceToOperator(surface: DesktopSurface): Operator {
   }
 }
 
-async function getLocalBrowserOperator() {
-  await checkBrowserAvailability();
-  const settings = SettingStore.getStore();
-  const configuredSearchEngine =
-    settings.searchEngineForBrowser ?? SearchEngineForSettings.GOOGLE;
-  const searchEngine = {
-    [SearchEngineForSettings.GOOGLE]: SearchEngine.GOOGLE,
-    [SearchEngineForSettings.BAIDU]: SearchEngine.BAIDU,
-    [SearchEngineForSettings.BING]: SearchEngine.BING,
-  }[configuredSearchEngine];
-  return DefaultBrowserOperator.getInstance(
-    false,
-    false,
-    false,
-    true,
-    searchEngine,
+async function resolveRemoteComputerDescriptor(
+  signal: AbortSignal,
+  desktopControlToken: string,
+) {
+  const fencedGatewayUrl = resolveFencedMeshGateway(
+    process.env.AILLIUM_MESH_FENCED_GATEWAY_URL,
   );
-}
-
-async function getRemoteBrowserOperator() {
-  const existingUrl = await ProxyClient.getBrowserCDPUrl();
-  const cdpUrl =
-    existingUrl ||
-    ((await ipcServer.allocRemoteResource({ resourceType: 'hdfBrowser' }))
-      ? await ProxyClient.getBrowserCDPUrl()
-      : null);
-  if (!cdpUrl) {
-    throw new Error('Remote browser resource is not available');
+  if (!fencedGatewayUrl) {
+    throw new DesktopControlError(
+      'Remote computer control requires a fenced Mesh gateway',
+      'DESKTOP_REMOTE_FENCING_REQUIRED',
+      503,
+    );
   }
-  return RemoteBrowserOperator.getInstance(cdpUrl, false, false, false, true);
-}
-
-async function getRemoteComputerClient() {
   const sandbox = await ProxyClient.getSandboxInfo();
   if (!sandbox?.sandBoxId) {
     throw new Error('Remote computer resource is not available');
   }
-  return new RemoteComputer(sandbox.sandBoxId);
+  const authHeaders = await getAuthHeader();
+  throwIfDesktopActionAborted(signal);
+  return {
+    instanceId: sandbox.sandBoxId,
+    proxyUrl: fencedGatewayUrl,
+    authHeaders,
+    desktopControlToken,
+  };
 }
 
-async function executeBrowserAction(
-  surface: DesktopSurface,
+async function resolveRemoteBrowserCdpUrl(signal: AbortSignal) {
+  let cdpUrl = await ProxyClient.getBrowserCDPUrl(signal);
+  if (!cdpUrl) {
+    await ProxyClient.allocResource('hdfBrowser', signal);
+    cdpUrl = await ProxyClient.getBrowserCDPUrl(signal);
+  }
+  if (!cdpUrl) throw new Error('Remote browser resource is not available');
+  return cdpUrl;
+}
+
+async function executeRemoteResourceAction(
   action: string,
   args: Record<string, unknown>,
+  signal: AbortSignal,
 ) {
-  const operator =
-    surface === 'remote_browser'
-      ? await getRemoteBrowserOperator()
-      : await getLocalBrowserOperator();
-
-  if (action === 'screen.capture') {
-    return await operator.screenshot();
+  if (action === 'remote.allocate_browser') {
+    return await ProxyClient.allocResource('hdfBrowser', signal);
   }
-
-  const parsedPrediction =
-    action === 'browser.navigate'
-      ? {
-          action_type: 'navigate',
-          action_inputs: {
-            content: readString(args.url) ?? readString(args.target) ?? '',
-          },
-        }
-      : action === 'browser.navigate_back'
-        ? {
-            action_type: 'navigate_back',
-            action_inputs: {},
-          }
-        : action === 'input.type_text'
-          ? {
-              action_type: 'type',
-              action_inputs: { content: readString(args.text) ?? '' },
-            }
-          : action === 'input.hotkey'
-            ? {
-                action_type: 'hotkey',
-                action_inputs: {
-                  key: readString(args.key) ?? readString(args.hotkey) ?? '',
-                },
-              }
-            : action === 'mouse.scroll'
-              ? {
-                  action_type: 'scroll',
-                  action_inputs: {
-                    direction: readString(args.direction) ?? 'down',
-                  },
-                }
-              : null;
-
-  if (!parsedPrediction) {
-    throw new Error(`Unsupported browser action: ${action}`);
+  if (action === 'remote.allocate_computer') {
+    return await ProxyClient.allocResource('computer', signal);
   }
-
-  return await operator.execute(
-    createExecuteParams(parsedPrediction, 1920, 1080, 1),
-  );
+  if (action === 'remote.release_resource') {
+    const resourceType =
+      readString(args.resourceType) === 'computer' ? 'computer' : 'hdfBrowser';
+    return await ProxyClient.releaseResource(resourceType, signal);
+  }
+  if (action === 'remote.get_rdp_url') {
+    return readString(args.resourceType) === 'hdfBrowser'
+      ? await ProxyClient.getBrowserCDPUrl(signal)
+      : await ProxyClient.getSandboxRDPUrl(signal);
+  }
+  throw new Error(`Unsupported remote resource action: ${action}`);
 }
 
-async function executeLocalComputerAction(
-  action: string,
-  args: Record<string, unknown>,
-) {
-  const operator = new NutJSElectronOperator();
-  const display = getScreenSize();
-
-  if (action === 'screen.get_size') {
-    return {
-      width: display.physicalSize.width,
-      height: display.physicalSize.height,
-      scaleFactor: display.scaleFactor,
-    };
-  }
-
-  if (action === 'screen.capture') {
-    return await operator.screenshot();
-  }
-
-  const x =
-    readNumber(args.x) ??
-    readNumber(args.startX) ??
-    Math.round(display.physicalSize.width / 2);
-  const y =
-    readNumber(args.y) ??
-    readNumber(args.startY) ??
-    Math.round(display.physicalSize.height / 2);
-  const endX = readNumber(args.endX);
-  const endY = readNumber(args.endY);
-
-  const parsedPrediction =
-    action === 'input.type_text'
-      ? {
-          action_type: 'type',
-          action_inputs: { content: readString(args.text) ?? '' },
-        }
-      : action === 'input.hotkey'
-        ? {
-            action_type: 'hotkey',
-            action_inputs: {
-              key: readString(args.key) ?? readString(args.hotkey) ?? '',
-            },
-          }
-        : action === 'mouse.click'
-          ? {
-              action_type: 'click',
-              action_inputs: { start_box: createPointBox(x, y) },
-            }
-          : action === 'mouse.double_click'
-            ? {
-                action_type: 'double_click',
-                action_inputs: { start_box: createPointBox(x, y) },
-              }
-            : action === 'mouse.right_click'
-              ? {
-                  action_type: 'right_click',
-                  action_inputs: { start_box: createPointBox(x, y) },
-                }
-              : action === 'mouse.drag'
-                ? {
-                    action_type: 'drag',
-                    action_inputs: {
-                      start_box: createPointBox(x, y),
-                      end_box: createOperatorBox(
-                        endX ?? x,
-                        endY ?? y,
-                        endX ?? x,
-                        endY ?? y,
-                      ),
-                    },
-                  }
-                : action === 'mouse.scroll'
-                  ? {
-                      action_type: 'scroll',
-                      action_inputs: {
-                        start_box: createPointBox(x, y),
-                        direction: readString(args.direction) ?? 'down',
-                      },
-                    }
-                  : null;
-
-  if (!parsedPrediction) {
-    throw new Error(`Unsupported local computer action: ${action}`);
-  }
-
-  return await operator.execute(
-    createExecuteParams(
-      parsedPrediction,
-      display.physicalSize.width,
-      display.physicalSize.height,
-      display.scaleFactor,
-    ),
-  );
+function desktopRuntimeControls() {
+  return {
+    pause: async () => {
+      await ipcServer.pauseRun();
+    },
+    resume: async () => {
+      await ipcServer.resumeRun();
+    },
+    cooperativeStop: async () => {
+      await ipcServer.stopRun();
+    },
+    forceStop: () => {
+      const manager = GUIAgentManager.getInstance();
+      const abortController = store.getState().abortController;
+      const agent = manager.getAgent();
+      abortController?.abort();
+      agent?.resume();
+      agent?.stop();
+      manager.clearAgent();
+      store.setState({ abortController: null, thinking: false });
+      // Let the normal IPC cleanup (window/marker state) finish, but do not let
+      // a blocked cleanup handler extend the hard teardown deadline.
+      void ipcServer.stopRun().catch((error) => {
+        logger.error('[desktop-rpc-bridge] forced stop cleanup failed', error);
+      });
+    },
+  };
 }
 
-async function executeRemoteComputerAction(
-  action: string,
-  args: Record<string, unknown>,
-) {
-  const remoteComputer = await getRemoteComputerClient();
-
-  if (action === 'screen.get_size') {
-    return await remoteComputer.getScreenSize();
+function throwIfDesktopActionAborted(signal: AbortSignal) {
+  if (signal.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DesktopControlError(
+          'Desktop action was cancelled',
+          'DESKTOP_SESSION_STOPPED',
+          409,
+        );
   }
-
-  if (action === 'screen.capture') {
-    return {
-      base64: await remoteComputer.takeScreenshot(),
-      scaleFactor: 1,
-    };
-  }
-
-  if (action === 'input.type_text') {
-    await remoteComputer.typeText(readString(args.text) ?? '');
-    return { ok: true };
-  }
-
-  if (
-    action === 'mouse.click' ||
-    action === 'mouse.double_click' ||
-    action === 'mouse.right_click'
-  ) {
-    const x = readNumber(args.x);
-    const y = readNumber(args.y);
-    if (x === null || y === null) {
-      throw new Error('x and y are required');
-    }
-    await remoteComputer.clickMouse(
-      x,
-      y,
-      action === 'mouse.double_click'
-        ? 'DoubleLeft'
-        : action === 'mouse.right_click'
-          ? 'Right'
-          : 'Left',
-      true,
-      true,
-    );
-    return { ok: true };
-  }
-
-  if (action === 'mouse.drag') {
-    const startX = readNumber(args.startX);
-    const startY = readNumber(args.startY);
-    const endX = readNumber(args.endX);
-    const endY = readNumber(args.endY);
-    if (startX === null || startY === null || endX === null || endY === null) {
-      throw new Error('startX, startY, endX, and endY are required');
-    }
-    await remoteComputer.dragMouse(startX, startY, endX, endY);
-    return { ok: true };
-  }
-
-  if (action === 'mouse.scroll') {
-    const x = readNumber(args.x) ?? 0;
-    const y = readNumber(args.y) ?? 0;
-    const rawDirection = readString(args.direction)?.toLowerCase() ?? 'down';
-    const direction =
-      rawDirection === 'up'
-        ? 'Up'
-        : rawDirection === 'left'
-          ? 'Left'
-          : rawDirection === 'right'
-            ? 'Right'
-            : 'Down';
-    await remoteComputer.scroll(x, y, direction, readNumber(args.amount) ?? 1);
-    return { ok: true };
-  }
-
-  if (action === 'input.hotkey') {
-    const operator = await RemoteComputerOperator.create();
-    return await operator.execute(
-      createExecuteParams(
-        {
-          action_type: 'hotkey',
-          action_inputs: {
-            key: readString(args.key) ?? readString(args.hotkey) ?? '',
-          },
-        },
-        1,
-        1,
-        1,
-      ),
-    );
-  }
-
-  throw new Error(`Unsupported remote computer action: ${action}`);
 }
 
-async function performAction(body: Record<string, unknown>) {
+async function performScopedAction(
+  body: Record<string, unknown>,
+  identity: DesktopControlIdentity,
+  desktopControlToken: string,
+) {
+  const target = readDesktopControlTarget(body);
+  assertDesktopControlTarget(identity, target);
+  desktopSessions.ensure(identity);
+
   const action = readString(body.action);
   if (!action) {
     throw new Error('action is required');
   }
 
-  const requestedSurface = resolveSurface(body.requestedSurface);
+  if (action === 'agent.pause') {
+    return desktopSessions.pause(identity);
+  }
+  if (action === 'agent.resume') {
+    return desktopSessions.resume(identity);
+  }
+  if (action === 'agent.stop') {
+    const args =
+      body.arguments &&
+      typeof body.arguments === 'object' &&
+      !Array.isArray(body.arguments)
+        ? (body.arguments as Record<string, unknown>)
+        : {};
+    return desktopSessions.stop(identity, {
+      desktopControlToken,
+      ...(typeof args.force === 'boolean' ? { force: args.force } : {}),
+      ...(typeof args.deadlineMs === 'number' &&
+      Number.isFinite(args.deadlineMs)
+        ? { deadlineMs: args.deadlineMs }
+        : {}),
+    });
+  }
+
+  if (action === 'agent.run' || action === 'computer.execute_instruction') {
+    const requestedSurface = resolveSurface(body.requestedSurface);
+    if (!isGovernedAgentSurface(requestedSurface)) {
+      throw new DesktopControlError(
+        'The remote-computer agent loop is not isolated from Electron main',
+        'DESKTOP_AGENT_ISOLATION_REQUIRED',
+        409,
+      );
+    }
+    return desktopSessions.runOwnedAction(
+      identity,
+      async (signal) => {
+        const args =
+          body.arguments &&
+          typeof body.arguments === 'object' &&
+          !Array.isArray(body.arguments)
+            ? (body.arguments as Record<string, unknown>)
+            : {};
+        const instructions =
+          readString(args.prompt) ?? readString(args.instructions);
+        if (action === 'computer.execute_instruction' && !instructions) {
+          throw new Error('prompt or instructions is required');
+        }
+        if (body.requestedSurface) {
+          SettingStore.set('operator', mapSurfaceToOperator(requestedSurface));
+        }
+        if (instructions) {
+          await ipcServer.setInstructions({ instructions });
+          throwIfDesktopActionAborted(signal);
+        }
+        throwIfDesktopActionAborted(signal);
+        await ipcServer.runAgent();
+        throwIfDesktopActionAborted(signal);
+        return action === 'computer.execute_instruction'
+          ? { ok: true, instructions }
+          : { ok: true };
+      },
+      desktopRuntimeControls(),
+    );
+  }
+
   const args =
     body.arguments &&
     typeof body.arguments === 'object' &&
     !Array.isArray(body.arguments)
       ? (body.arguments as Record<string, unknown>)
       : {};
-
-  switch (action) {
-    case 'browser.check_availability':
-      return await checkBrowserAvailability();
-    case 'browser.navigate':
-    case 'browser.navigate_back':
-    case 'input.type_text':
-    case 'input.hotkey':
-    case 'mouse.scroll':
-    case 'screen.capture':
-      if (
-        requestedSurface === 'remote_browser' ||
-        requestedSurface === 'local_browser'
-      ) {
-        return await executeBrowserAction(requestedSurface, action, args);
-      }
-      if (requestedSurface === 'local_computer') {
-        return await executeLocalComputerAction(action, args);
-      }
-      return await executeRemoteComputerAction(action, args);
-    case 'screen.get_size':
-    case 'mouse.click':
-    case 'mouse.double_click':
-    case 'mouse.right_click':
-    case 'mouse.drag':
-      return requestedSurface === 'local_computer'
-        ? await executeLocalComputerAction(action, args)
-        : await executeRemoteComputerAction(action, args);
-    case 'computer.execute_instruction': {
-      const instructions =
-        readString(args.prompt) ?? readString(args.instructions);
-      if (!instructions) {
-        throw new Error('prompt or instructions is required');
-      }
-      SettingStore.set('operator', mapSurfaceToOperator(requestedSurface));
-      await ipcServer.setInstructions({ instructions });
-      await ipcServer.runAgent();
-      return { ok: true, instructions };
-    }
-    case 'agent.run': {
-      const instructions =
-        readString(args.prompt) ?? readString(args.instructions);
-      if (instructions) {
-        await ipcServer.setInstructions({ instructions });
-      }
-      if (body.requestedSurface) {
-        SettingStore.set('operator', mapSurfaceToOperator(requestedSurface));
-      }
-      await ipcServer.runAgent();
-      return { ok: true };
-    }
-    case 'agent.pause':
-      await ipcServer.pauseRun();
-      return { ok: true };
-    case 'agent.resume':
-      await ipcServer.resumeRun();
-      return { ok: true };
-    case 'agent.stop':
-      await ipcServer.stopRun();
-      return { ok: true };
-    case 'remote.allocate_browser':
-      return await ipcServer.allocRemoteResource({
-        resourceType: 'hdfBrowser',
-      });
-    case 'remote.allocate_computer':
-      return await ipcServer.allocRemoteResource({ resourceType: 'computer' });
-    case 'remote.release_resource': {
-      const resourceType =
-        readString(args.resourceType) === 'computer'
-          ? 'computer'
-          : 'hdfBrowser';
-      return await ipcServer.releaseRemoteResource({ resourceType });
-    }
-    case 'remote.get_rdp_url': {
-      const resourceType =
-        readString(args.resourceType) === 'hdfBrowser'
-          ? 'hdfBrowser'
-          : 'computer';
-      return await ipcServer.getRemoteResourceRDPUrl({ resourceType });
-    }
-    default:
-      throw new Error(`Unsupported desktop RPC action: ${action}`);
+  if (
+    action === 'remote.allocate_browser' ||
+    action === 'remote.allocate_computer' ||
+    action === 'remote.release_resource' ||
+    action === 'remote.get_rdp_url'
+  ) {
+    return desktopSessions.runOwnedAction(identity, async (signal) => {
+      throwIfDesktopActionAborted(signal);
+      const result = await executeRemoteResourceAction(action, args, signal);
+      throwIfDesktopActionAborted(signal);
+      return result;
+    });
   }
+
+  // Every direct browser, computer, keyboard, mouse, screenshot, and remote
+  // resource action owns the physical desktop until its real promise settles.
+  // Abort fences its result; stop cannot claim verified teardown merely because
+  // local references were cleared while the underlying action is still alive.
+  const requestedSurface = resolveSurface(body.requestedSurface);
+  const isolatedSurface =
+    action !== 'browser.check_availability' &&
+    (requestedSurface === 'remote_browser' ||
+      requestedSurface === 'remote_computer' ||
+      requestedSurface === 'local_browser' ||
+      requestedSurface === 'local_computer')
+      ? requestedSurface
+      : null;
+  let isolatedAction: IsolatedDesktopAction | null = null;
+  if (!isolatedSurface && action !== 'browser.check_availability') {
+    throw new DesktopControlError(
+      'This governed one-shot action has no killable runtime boundary',
+      'DESKTOP_ACTION_ISOLATION_REQUIRED',
+      409,
+    );
+  }
+  return desktopSessions.runOwnedAction(
+    identity,
+    async (signal) => {
+      throwIfDesktopActionAborted(signal);
+      if (isolatedSurface) {
+        const remoteBrowserCdpUrl =
+          isolatedSurface === 'remote_browser'
+            ? await resolveRemoteBrowserCdpUrl(signal)
+            : undefined;
+        const remoteComputer =
+          isolatedSurface === 'remote_computer'
+            ? await resolveRemoteComputerDescriptor(signal, desktopControlToken)
+            : undefined;
+        throwIfDesktopActionAborted(signal);
+        const display =
+          isolatedSurface === 'local_computer'
+            ? (() => {
+                const current = getScreenSize();
+                return {
+                  width: current.physicalSize.width,
+                  height: current.physicalSize.height,
+                  scaleFactor: current.scaleFactor,
+                };
+              })()
+            : undefined;
+        isolatedAction = new IsolatedDesktopAction(identity, {
+          surface: isolatedSurface,
+          action,
+          arguments: args,
+          ...(remoteBrowserCdpUrl ? { remoteBrowserCdpUrl } : {}),
+          ...(remoteComputer ? { remoteComputer } : {}),
+          ...(isolatedSurface === 'local_browser'
+            ? {
+                searchEngine:
+                  SettingStore.getStore().searchEngineForBrowser ??
+                  SearchEngineForSettings.GOOGLE,
+              }
+            : {}),
+          ...(display ? { display } : {}),
+        });
+        return await isolatedAction.run(signal);
+      }
+      const result = await checkBrowserAvailability();
+      throwIfDesktopActionAborted(signal);
+      return result;
+    },
+    {
+      ...(isolatedSurface === 'remote_computer'
+        ? {
+            cancelFence: async (
+              nextIdentity: DesktopControlIdentity,
+              nextDesktopControlToken: string,
+              signal: AbortSignal,
+            ) =>
+              isolatedAction
+                ? await isolatedAction.cancelRemoteFence(
+                    nextIdentity,
+                    nextDesktopControlToken,
+                    signal,
+                  )
+                : null,
+          }
+        : {}),
+      cooperativeStop: () => isolatedAction?.terminate(),
+      forceStop: () => isolatedAction?.terminate(),
+    },
+  );
 }
 
 function buildCapabilitiesPayload() {
@@ -706,9 +593,9 @@ function buildCapabilitiesPayload() {
 }
 
 export function startDesktopRpcBridge() {
-  if (!DESKTOP_RPC_TOKEN) {
+  if (!DESKTOP_AUTHORITY_PUBLIC_KEY) {
     logger.warn(
-      '[desktop-rpc-bridge] Desktop RPC bridge disabled: AILLIUM_DESKTOP_BRIDGE_TOKEN not configured. All requests will be rejected until a token is set.',
+      '[desktop-rpc-bridge] Desktop RPC bridge disabled: scoped desktop-control token verification is not configured. Set AILLIUM_DESKTOP_AUTHORITY_PUBLIC_KEY_BASE64.',
     );
   }
 
@@ -720,7 +607,8 @@ export function startDesktopRpcBridge() {
       return;
     }
 
-    if (!(await isAuthorized(req))) {
+    const authorization = await authorizeRequest(req);
+    if (!authorization) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
     }
@@ -734,6 +622,9 @@ export function startDesktopRpcBridge() {
       }
 
       if (requestPath === '/handoff') {
+        const target = readDesktopControlTarget(body);
+        assertDesktopControlTarget(authorization.identity, target);
+        desktopSessions.assertAcceptsInput(authorization.identity);
         const requestedSurface = resolveSurface(body.requestedSurface);
         const prompt = readString(body.prompt);
         SettingStore.set('operator', mapSurfaceToOperator(requestedSurface));
@@ -753,7 +644,11 @@ export function startDesktopRpcBridge() {
       }
 
       if (requestPath === '/invoke') {
-        const result = await performAction(body);
+        const result = await performScopedAction(
+          body,
+          authorization.identity,
+          authorization.token,
+        );
         sendJson(res, 200, {
           ok: true,
           action: readString(body.action),
@@ -765,10 +660,15 @@ export function startDesktopRpcBridge() {
       sendJson(res, 404, { error: 'Not Found' });
     } catch (error) {
       logger.error('[desktop-rpc-bridge]', error);
-      sendJson(res, 400, {
-        error:
-          error instanceof Error ? error.message : 'Desktop RPC bridge error',
-      });
+      sendJson(
+        res,
+        error instanceof DesktopControlError ? error.statusCode : 400,
+        {
+          error:
+            error instanceof Error ? error.message : 'Desktop RPC bridge error',
+          ...(error instanceof DesktopControlError ? { code: error.code } : {}),
+        },
+      );
     }
   });
 

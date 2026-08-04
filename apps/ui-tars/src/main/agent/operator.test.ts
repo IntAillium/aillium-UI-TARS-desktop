@@ -48,13 +48,16 @@ describe('NutJSElectronOperator', () => {
           toPNG: () => Buffer.from('mock-image'),
           resize: () => ({
             toPNG: () => Buffer.from('mock-image'),
+            toJPEG: () => Buffer.from('mock-image'),
           }),
         },
       };
 
-      vi.mocked(screen.getPrimaryDisplay).mockReturnValue(mockDisplay as any);
+      vi.mocked(screen.getPrimaryDisplay).mockReturnValue(
+        mockDisplay as unknown as Electron.Display,
+      );
       vi.mocked(desktopCapturer.getSources).mockResolvedValueOnce([
-        mockSource as any,
+        mockSource as unknown as Electron.DesktopCapturerSource,
       ]);
 
       const result = await operator.screenshot();

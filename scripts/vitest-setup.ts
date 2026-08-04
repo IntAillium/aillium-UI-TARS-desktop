@@ -12,6 +12,7 @@ vi.mock('electron-log', () => ({
     transports: {
       file: {
         level: 'info',
+        getFile: () => ({ path: '/tmp/ui-tars-test.log' }),
       },
     },
   },
@@ -21,6 +22,9 @@ vi.mock('electron-log', () => ({
 vi.mock('electron', () => ({
   app: {
     on: vi.fn(),
+    getPath: vi.fn(() => '/tmp'),
+    getVersion: vi.fn(() => '0.0.0-test'),
+    isPackaged: false,
   },
   shell: {
     openPath: vi.fn(),
